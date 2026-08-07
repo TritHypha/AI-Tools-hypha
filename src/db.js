@@ -61,10 +61,34 @@ function openDb(dbPath) {
  *                  the tool run with nothing to load and nothing left behind.
  *
  *  Returns the fact object; when keepOpen is set it also carries `.db`. */
+/**
+ * The receipt, not the build path.
+ *
+ * `meta.root` and the JSON mirror's `root` key are DISPLAY-ONLY — nothing reads
+ * either back as a filesystem path, because every extractor takes the root as a
+ * parameter instead. So the persisted value records WHICH checkout was mapped, never
+ * WHERE it sat on the machine that mapped it.
+ *
+ * That distinction matters because `report.md` exists to be shared — pasted into an
+ * issue, attached to a review — and an absolute path carries a username with it. The
+ * artifacts are correctly gitignored, so nothing reached the repository; this closes
+ * the other route, which no .gitignore can cover.
+ */
+function displayRoot(root) {
+  if (typeof root === "string") {
+    const parts = root.replace(/[\\/]+$/, "").split(/[\\/]/);
+    const base = parts[parts.length - 1];
+    if (base !== "") return base;
+  }
+  // Terminal arm: anything unrecognised is named as unknown rather than passed
+  // through — a value we cannot vouch for must not be persisted verbatim.
+  return "<unknown>";
+}
+
 function buildMap(root, dbPath, opts) {
   const { json = true, keepOpen = false } = opts || {};
   const facts = {
-    root,
+    root: displayRoot(root),
     builtAt: new Date().toISOString(),
     gateList: X.extractGateList(root),
     stdlibCases: X.extractStdlibCases(root),
@@ -121,7 +145,7 @@ function buildMap(root, dbPath, opts) {
   tx("INSERT INTO parser_kinds VALUES (?)", facts.parserKinds, (k) => [k]);
   tx("INSERT INTO diagnostics_codes VALUES (?,?,?,?)", facts.diagnostics,
      (r) => [r.code, r.file, r.line, r.context]);
-  db.prepare("INSERT INTO meta VALUES (?,?)").run("root", root);
+  db.prepare("INSERT INTO meta VALUES (?,?)").run("root", displayRoot(root));
   db.prepare("INSERT INTO meta VALUES (?,?)").run("builtAt", facts.builtAt);
   if (keepOpen) facts.db = db; else db.close();
 
@@ -132,4 +156,4 @@ function buildMap(root, dbPath, opts) {
   return facts;
 }
 
-module.exports = { buildMap, DatabaseSync };
+module.exports = { buildMap, displayRoot, DatabaseSync };

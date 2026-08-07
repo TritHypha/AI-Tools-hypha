@@ -295,3 +295,38 @@ mirror** — confirmed against the shipped file, whose top-level keys are the fa
 be told that it cannot — it will simply see no runtime lane and report the static one as though it
 were the whole picture. ⬜ If the mirror is your interface, the four-quadrant reading in
 [SPOREPRINT.md](SPOREPRINT.md) is unavailable to you.
+
+---
+
+## 13. The artifacts land in the CURRENT DIRECTORY, and the persisted root is a receipt
+
+Two behaviours worth knowing before running `hypha map` from anywhere other than this
+repository.
+
+### It writes where you stand, not where it lives
+
+`--db` defaults to a path relative to the **current working directory**, so running
+`hypha map` from inside another checkout drops a ~270 KB `hypha.db` (and a ~290 KB
+`hypha.db.json`) *there* — untracked, and not covered by this repository's
+`.gitignore`, which only protects this directory.
+
+Pass `--db` explicitly, or run from the hypha root:
+
+```bash
+node src/cli.js map --root ../../Galerina --db ./hypha.db
+```
+
+### The persisted root is deliberately not a path
+
+`meta.root` and the JSON mirror's `root` key record the checkout's **basename**
+(`Galerina`), never its absolute location. Both are display-only — every extractor
+takes the root as a parameter, so nothing reads either back as a filesystem path.
+
+The reason is `report.md`: it exists to be shared, and it prints `meta.root` in its
+header. An absolute path there carries a username off the machine that produced it.
+The generated artifacts are gitignored and have never been committed, so nothing
+reached the repository — but `.gitignore` cannot cover the sharing route, and this
+does. `npm run check-docs` enforces it, with a control proving the detector fires on a
+raw absolute path before the clean result is believed.
+
+An unrecognised root is persisted as `<unknown>` rather than passed through.

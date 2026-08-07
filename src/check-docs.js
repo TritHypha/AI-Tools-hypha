@@ -67,7 +67,12 @@ function tablesIn(text) {
 function tablesInDoc(md, knownNames) {
   const out = {};
   if (!md) return out;
-  const fenced = [...md.matchAll(/```(?:sql)?\r?\n([\s\S]*?)```/g)].map((m) => m[1]).join("\n");
+  // Same pairing rule as the flag scan: every fence delimits, only SQL fences contribute.
+  // Accepting just ```/```sql as an opener left other-language blocks unpaired and let
+  // their closers pair with later openers, capturing prose that was never a schema.
+  const fenced = [...md.matchAll(/```([a-z]*)\r?\n([\s\S]*?)```/g)]
+    .filter((m) => m[1] === "" || m[1] === "sql")
+    .map((m) => m[2]).join("\n");
   for (const name of knownNames) {
     const re = new RegExp("(?:CREATE\\s+TABLE(?:\\s+IF\\s+NOT\\s+EXISTS)?\\s+)?\\b" + name + "\\s*\\(([^)]*)\\)");
     const m = re.exec(fenced);
@@ -192,7 +197,10 @@ const say = (ok, label, detail) => { results.push({ ok, label, detail }); };
     const usage = /usage:\s*hypha\s*<([a-z|]+)>/.exec(cli);
     const known = usage ? usage[1].split("|") : [];
     const fenced = [readme, doc].filter(Boolean)
-      .flatMap((t) => [...t.matchAll(/```(?:bash|sh)?\r?\n([\s\S]*?)```/g)].map((m) => m[1])).join("\n");
+      // Same pairing rule as the flag scan below: all fences delimit, shell fences contribute.
+      .flatMap((t) => [...t.matchAll(/```([a-z]*)\r?\n([\s\S]*?)```/g)]
+        .filter((m) => m[1] === "" || m[1] === "bash" || m[1] === "sh")
+        .map((m) => m[2])).join("\n");
     const quoted = [...new Set([...fenced.matchAll(/(?:node\s+src\/cli\.js|hypha)\s+([a-z-]+)/g)].map((m) => m[1]))];
     if (known.length === 0) say(false, "cli surface: no usage string found in src/cli.js", "cannot establish the command set");
     else {
@@ -231,7 +239,17 @@ const say = (ok, label, detail) => { results.push({ ok, label, detail }); };
     for (const f of ["README.md", "docs/QUERIES.md", "docs/SCHEMA.md", "docs/LIMITS.md", "docs/SPOREPRINT.md"]) {
       const t = read(path.join(HERE, f));
       if (!t) continue;
-      const fenced = [...t.matchAll(/```(?:bash|sh)?\r?\n([\s\S]*?)```/g)].map((m) => m[1]).join("\n");
+      // EVERY fence must participate in PAIRING, even ones whose flags we ignore.
+      // The old pattern accepted only ```/```bash/```sh as an opener, so a block
+      // tagged any other language left its markers unpaired — and the scan then
+      // paired that block's CLOSER with a later opener, swallowing the prose
+      // between them. A prose table containing `--scan full` was harvested that
+      // way as a "documented flag", and which flags were found depended on how
+      // many code blocks happened to precede them. Adding an unrelated ```bash
+      // example anywhere in any doc could change the answer here.
+      const fenced = [...t.matchAll(/```([a-z]*)\r?\n([\s\S]*?)```/g)]
+        .filter((m) => m[1] === "" || m[1] === "bash" || m[1] === "sh")
+        .map((m) => m[2]).join("\n");
       for (const m of fenced.matchAll(/--([a-z][a-z0-9-]*)/g)) promised.add(m[1]);
     }
     if (declared.size === 0) say(false, "flags: no usage string found", "the check cannot run");
@@ -332,6 +350,60 @@ const say = (ok, label, detail) => { results.push({ ok, label, detail }); };
 }
 
 // ── report ───────────────────────────────────────────────────────────────────
+// ── artifact hygiene: the persisted root must be a receipt, not a build path ──
+//
+// `report.md` exists to be SHARED — pasted into an issue, attached to a review — and
+// it prints `meta.root` in its header. An absolute path there carries a username off
+// this machine. The generated artifacts are correctly gitignored, so nothing reached
+// the repository; .gitignore cannot cover the sharing route, so this does.
+//
+// A KAT WITH ITS CONTROL. Asserting only "the output has no path shape" would pass
+// just as happily against a detector that matches nothing, so the same regex is first
+// required to FIRE on the raw input. Without that, this check would measure itself.
+{
+  const ABSOLUTE = /[A-Za-z]:[\\/]Users[\\/]|\/(?:home|Users)\/[^/\s"']+/;
+  const SAMPLE = "C:\\Users\\someone\\Documents\\GitHub\\Galerina";
+
+  let db = null;
+  try { db = require("./db.js"); } catch { db = null; }
+
+  if (db === null || typeof db.displayRoot !== "function") {
+    // Cannot run ⇒ does not pass. node:sqlite is a Node 24 built-in and db.js
+    // requires it at load, so an older runtime lands here rather than green.
+    results.push({ skipped: true, label: "artifact hygiene: db.js not loadable",
+      detail: "node:sqlite unavailable? the check cannot run, so it does not pass" });
+  } else {
+    say(ABSOLUTE.test(SAMPLE),
+      "artifact hygiene CONTROL: the detector fires on a raw absolute path",
+      "without this, a clean result would only prove the regex matches nothing");
+
+    const shown = db.displayRoot(SAMPLE);
+    say(!ABSOLUTE.test(shown),
+      "artifact hygiene: displayRoot() strips the absolute path",
+      `${SAMPLE} -> ${shown}`);
+    say(shown === "Galerina",
+      "artifact hygiene: the receipt is still useful (basename kept)",
+      `got ${JSON.stringify(shown)}`);
+    say(db.displayRoot(undefined) === "<unknown>",
+      "artifact hygiene: terminal arm names an unrecognised root rather than passing it through",
+      `got ${JSON.stringify(db.displayRoot(undefined))}`);
+
+    // And the artifacts themselves, when present. Absent ⇒ SKIP: "no file, no hits"
+    // is a fact about the scan, not about the tool.
+    for (const rel of ["hypha.db.json", "report.md"]) {
+      const text = read(path.join(HERE, rel));
+      if (text === null) {
+        results.push({ skipped: true, label: `artifact hygiene: ${rel} not present`,
+          detail: "nothing to scan — absence is not evidence of cleanliness" });
+        continue;
+      }
+      const hit = ABSOLUTE.exec(text);
+      say(hit === null, `artifact hygiene: ${rel} carries no absolute local path`,
+        hit === null ? `${text.length} bytes scanned` : `found at offset ${hit.index} — regenerate it`);
+    }
+  }
+}
+
 console.log("=== hypha --check-docs ===");
 let failed = 0, skipped = 0;
 for (const r of results) {

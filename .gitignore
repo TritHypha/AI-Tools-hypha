@@ -2,3 +2,4 @@ hypha.db
 hypha.db.json
 report.md
 node_modules/
+.myco/
