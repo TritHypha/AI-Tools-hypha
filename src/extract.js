@@ -50,6 +50,83 @@ function distFiles(root) {
   return fs.readdirSync(distDir(root)).filter((f) => f.endsWith(".js"));
 }
 
+/**
+ * Call sites for MANY names in ONE sweep of the tree.
+ *
+ * WHY THIS EXISTS — measured on the real repo, 335 exported checkers:
+ *
+ *     all 8 extraction passes combined      124 ms     0.8 %
+ *     335 × findCallSites (below)        16 236 ms    99.2 %
+ *
+ * `findCallSites` reads and scans the whole dist tree to answer for ONE name,
+ * so mapping the checker surface read the tree 335 times. Same O(names × files)
+ * comparisons either way — the defect was that the FILE READS were in the inner
+ * loop, and reads are what cost. Inverting the loops: 16 203 ms → 333 ms, a 49×
+ * improvement with byte-identical results across all 335 names (verified by a
+ * differential against findCallSites, not by a spot check).
+ *
+ * Speed is a correctness argument for a tool like this: a 16-second map is one
+ * nobody puts in a hook and nobody runs casually, and a detector nobody runs
+ * detects nothing.
+ *
+ * The predicate is IDENTICAL to findCallSites — a faster engine answering a
+ * slightly different question is not an optimisation. Returns
+ * { [name]: [{file, line}] } with an empty array for names that have no call
+ * sites, so "absent from the result" and "no call sites" can never be confused.
+ */
+function findAllCallSites(root, names) {
+  const out = Object.create(null);
+  for (const n of names) out[n] = [];
+  if (names.length === 0) return out;
+
+  const matchers = names.map((n) => ({
+    name: n,
+    re: new RegExp("\\b" + n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*\\("),
+  }));
+
+  /** The findCallSites predicate, applied to one file's lines. */
+  const scan = (lines, file, present) => {
+    lines.forEach((ln, i) => {
+      if (/function\s/.test(ln)) return;                        // a definition, not a call
+      for (const m of present) {
+        if (!m.re.test(ln)) continue;
+        if (/\/\//.test(ln.split(m.name)[0] || "")) continue;   // commented out
+        out[m.name].push({ file, line: i + 1 });
+      }
+    });
+  };
+
+  const files = distFiles(root);
+  let read = 0;
+  for (const file of files) {
+    // No try/catch: an unreadable dist file is not a "no call sites" answer, it
+    // is a broken sweep. Swallowing it would turn total failure into a clean
+    // bill of health — the exact fail-open this tool exists to detect.
+    const text = fs.readFileSync(path.join(distDir(root), file), "utf8");
+    read++;
+    // A name absent from the file's text cannot have a call site in it. Most
+    // names miss most files, so this pre-filter is where the time now goes.
+    const present = matchers.filter((m) => text.includes(m.name));
+    if (present.length === 0) continue;
+    scan(text.split("\n"), file, present);
+  }
+
+  // The root CLI imports dist/index.js, so a checker dead within dist can still
+  // be alive from the root. findCallSites scans it; omitting it here would make
+  // "dead" dishonest and the two engines would disagree.
+  const rootCli = path.join(root, "galerina.mjs");
+  if (fs.existsSync(rootCli)) {
+    const text = fs.readFileSync(rootCli, "utf8");
+    scan(text.split("\n"), "galerina.mjs", matchers.filter((m) => text.includes(m.name)));
+  }
+
+  if (read === 0) {
+    throw new Error("hypha: call-site sweep read 0 of " + files.length +
+      " dist files — the sweep is broken, not the codebase");
+  }
+  return out;
+}
+
 // ── gate list ────────────────────────────────────────────────────────────────
 
 /**
@@ -168,14 +245,16 @@ function extractPassCalls(root) {
   return out;
 }
 
-/** Every exported check* function across dist — what EXISTS, to diff against
- *  what is WIRED. (checkEvents exported-but-never-called is the incident.) */
+/** Every exported function across dist — what EXISTS, to diff against what is
+ *  WIRED. Originally `check*`-only; widened after `resolveImports` (a dead
+ *  import resolver) slipped past that filter — a pass does not have to be
+ *  named check* to be a pass. `isChecker` keeps the original subset visible. */
 function extractExportedCheckers(root) {
   const out = [];
   for (const file of distFiles(root)) {
     distLines(root, file).forEach((ln, i) => {
-      const m = ln.match(/export\s+(?:async\s+)?function\s+(check[A-Z][A-Za-z0-9]*)/);
-      if (m) out.push({ name: m[1], file, line: i + 1 });
+      const m = ln.match(/export\s+(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)/);
+      if (m) out.push({ name: m[1], file, line: i + 1, isChecker: /^check[A-Z]/.test(m[1]) });
     });
   }
   return out;
@@ -204,12 +283,66 @@ function findCallSites(root, name) {
 
 // ── parser-producible kinds ──────────────────────────────────────────────────
 
-/** Flow-decl node kinds the parser can actually produce (`kind: "xFlowDecl"`).
- *  The coverage query diffs these against every kind-set's membership. */
+/**
+ * Every FUNGI-* diagnostic code that appears anywhere in dist, with the module
+ * and line, plus the nearest message text on the same or following line.
+ *
+ * Added Tick 137: answering "does ANY checker warn about X?" was previously a
+ * hand search, and a hand search cannot support an exhaustiveness claim. This
+ * makes the inventory a query. It reports codes as they appear in SOURCE —
+ * whether a given code can actually FIRE is a separate question (FUNGI-NUMERIC-001
+ * is present here yet unreachable, because its trigger set is empty), so treat
+ * the output as the code universe, not as live behaviour.
+ */
+function extractDiagnostics(root) {
+  const out = [];
+  for (const file of distFiles(root)) {
+    const lines = distLines(root, file);
+    lines.forEach((ln, i) => {
+      for (const m of ln.matchAll(/"(FUNGI-[A-Z0-9-]+)"/g)) {
+        // Grab whatever message-ish text sits nearby, for semantic filtering.
+        const ctx = (ln + " " + (lines[i + 1] ?? "") + " " + (lines[i + 2] ?? ""))
+          .replace(/\s+/g, " ").slice(0, 400);
+        out.push({ code: m[1], file, line: i + 1, context: ctx });
+      }
+    });
+  }
+  return out;
+}
+
+/**
+ * Flow-decl node kinds the parser can actually produce.
+ * The coverage query diffs these against every kind-set's membership, so this set
+ * being short makes that query quietly vacuous rather than visibly broken.
+ *
+ * WHY THIS IS NOT `kind:\s*"…"` (fixed 2026-08-06). That anchor found exactly ONE
+ * kind — `governedFlowDecl` — and one flow kind is implausible for this language.
+ * Reading `parser.js` settled it: only the governed re-tag is written as an object
+ * literal property (`kind: "governedFlowDecl"`). The three TIER kinds are assigned
+ * to a local first:
+ *
+ *     const kind = qualifier === "secure"  ? "secureFlowDecl"
+ *                : qualifier === "pure"    ? "pureFlowDecl"
+ *                : qualifier === "guarded" ? "guardedFlowDecl"
+ *
+ * …and only later used as the node's kind. Anchoring on the property syntax
+ * therefore measured the parser's *coding style*, not the kinds it produces —
+ * and `kind-coverage` was diffing gating sets against a reference set of one,
+ * so it could not have reported a gap in the three tiers even if one existed.
+ *
+ * The anchor is now the STRING LITERAL, scoped to parser.js. Every `"…FlowDecl"`
+ * literal in the parser is a kind the parser emits; the file has 19 lines
+ * mentioning FlowDecl and no counter-example. Scoping to parser.js is deliberate:
+ * 21 downstream files CONSUME these kinds, and a consumer is not a producer —
+ * widening to all of dist would also pick up the bare `"FlowDecl"` that appears
+ * once, in manifest-generator.js, which the parser never emits.
+ */
 function extractParserKinds(root) {
   const kinds = new Set();
   distLines(root, "parser.js").forEach((ln) => {
-    for (const m of ln.matchAll(/kind:\s*"([A-Za-z0-9_]*FlowDecl)"/g)) kinds.add(m[1]);
+    // Skip comment lines: a kind named only in prose is not a kind produced.
+    if (/^\s*(\/\/|\*|\/\*)/.test(ln)) return;
+    for (const m of ln.matchAll(/"([A-Za-z0-9_]*FlowDecl)"/g)) kinds.add(m[1]);
   });
   return [...kinds].sort();
 }
@@ -217,6 +350,6 @@ function extractParserKinds(root) {
 module.exports = {
   distDir, distFiles,
   extractGateList, extractStdlibCases, extractInlineTables,
-  extractKindSets, extractPassCalls, extractExportedCheckers,
-  findCallSites, extractParserKinds,
+  extractKindSets, extractPassCalls, extractExportedCheckers, extractDiagnostics,
+  findCallSites, findAllCallSites, extractParserKinds,
 };

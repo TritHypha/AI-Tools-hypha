@@ -6,7 +6,8 @@
   "bin": { "hypha": "./src/cli.js" },
   "scripts": {
     "map": "node src/cli.js map",
-    "report": "node src/cli.js report"
+    "report": "node src/cli.js report",
+    "check-docs": "node src/check-docs.js"
   },
   "author": "Trithypha <hello@trithypha.dev>",
   "license": "UNLICENSED",

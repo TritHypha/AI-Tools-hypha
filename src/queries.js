@@ -81,7 +81,7 @@ function kindCoverage(db) {
  *  already filtered out there.) */
 function deadExports(db) {
   return db.prepare(`
-    SELECT e.name, e.file, e.line,
+    SELECT e.name, e.file, e.line, e.is_checker,
            (SELECT COUNT(*) FROM checker_call_sites c WHERE c.name = e.name) AS calls
     FROM exported_checkers e
     ORDER BY calls ASC, e.name
@@ -118,6 +118,30 @@ function surface(db, name) {
   };
 }
 
+
+/** The diagnostic-code universe, optionally filtered by a semantic keyword over
+ *  the surrounding message text. Added so questions like "does ANY checker warn
+ *  about narrowing?" become a query instead of a hand search that cannot
+ *  support an exhaustiveness claim.
+ *  NOTE: presence in source does NOT mean a code can fire — FUNGI-NUMERIC-001
+ *  appears here yet is unreachable (empty trigger set). Reachability is a
+ *  separate, execution-only question. */
+function diagnostics(db, keyword) {
+  const codes = db.prepare(
+    "SELECT code, COUNT(*) AS sites, MIN(file) AS first_file, MIN(line) AS first_line FROM diagnostics_codes GROUP BY code ORDER BY code"
+  ).all();
+  if (!keyword) return { total: codes.length, codes };
+  const needles = keyword.split("|").map((k) => k.toLowerCase());
+  const hits = db.prepare("SELECT code, file, line, context FROM diagnostics_codes").all()
+    .filter((r) => needles.some((n) => (r.context || "").toLowerCase().includes(n)));
+  const byCode = {};
+  for (const h of hits) {
+    if (!byCode[h.code]) byCode[h.code] = { code: h.code, sites: [] };
+    if (byCode[h.code].sites.length < 3) byCode[h.code].sites.push(h.file + ":" + h.line);
+  }
+  return { total: codes.length, keyword, matched: Object.values(byCode) };
+}
+
 /** Render the full report as markdown — the artifact a human (or a PR bot)
  *  reads. Sections mirror the query list; every claim carries file:line. */
 function render(db) {
@@ -147,7 +171,13 @@ function render(db) {
   const dead = deadExports(db);
   L.push("", "## Dead exported checkers (zero call sites in dist + root CLI)", "");
   if (!dead.length) L.push("(none)");
-  for (const d of dead) L.push("- **" + d.name + "** (`" + d.file + ":" + d.line + "`) — never called");
+  for (const d of dead) L.push("- **" + d.name + "** (`" + d.file + ":" + d.line + "`) — never called" +
+    (d.is_checker ? " _(check\* pass)_" : ""));
+
+  const dg = diagnostics(db);
+  L.push("", "## Diagnostic-code universe", "",
+    "- distinct FUNGI-* codes in dist: **" + dg.total + "**",
+    "- (presence \u2260 reachability: a code with an empty trigger set never fires)");
 
   const s = surface(db);
   L.push("", "## Method surface summary", "",
@@ -165,6 +195,18 @@ function render(db) {
   ).get();
   if (hasVerified) {
     L.push("", "## Execution-verified surface (from sporeprint)", "");
+    const meta = readVerifiedMeta(db);
+    if (meta.ok) {
+      L.push("_Runtime facts stamped " + meta.values.stamped_at_utc +
+        " · run `" + meta.values.run_id.slice(0, 8) + "` · sporeprint " + meta.values.tool_version +
+        " · source `" + meta.values.source_identity.slice(0, 24) + "…`_", "");
+    } else {
+      // ★ Fail closed, loudly: an unstampable runtime half is UNKNOWN AGE, never
+      // silently current. The counts still print — they are real rows — but the
+      // reader is told exactly what guarantee they do not hold.
+      L.push("**⚠ runtime facts of UNKNOWN standing — " + meta.reason + ".** " +
+        "Treat the rows below as unverified until sporeprint re-stamps them.", "");
+    }
     for (const r of db.prepare(
       "SELECT receiver, status, COUNT(*) AS n FROM verified_surface GROUP BY receiver, status ORDER BY receiver, n DESC"
     ).all()) L.push("- " + r.receiver + " · " + r.status + ": " + r.n);
@@ -173,4 +215,54 @@ function render(db) {
   return L.join("\n");
 }
 
-module.exports = { open, duplicateSets, kindCoverage, deadExports, surface, render };
+// ── verified_meta: the runtime half's provenance, validated fail-closed ──────
+/**
+ * sporeprint stamps `verified_meta` (six keys) in the SAME transaction as the
+ * surface rows. This reader admits the stamp only when every check passes;
+ * every failure names its reason, because "UNKNOWN AGE" with no cause is
+ * uninvestigable. The timestamp is VISIBILITY, never authority — the digest is
+ * what binds the meta to the rows it claims to describe.
+ *
+ * Refusals, in test order:
+ *   - the table is absent (a pre-meta DB, or a foreign writer);
+ *   - a required key is missing or empty;
+ *   - the schema identifier is unknown;
+ *   - the stamp does not parse as RFC 3339 UTC, or post-dates now by > 5 min
+ *     (small skew tolerated; a future-dated stamp is refused, per the owner:
+ *     never silently current);
+ *   - the evidence digest does not match the rows actually present (the rows
+ *     were edited after stamping, or the stamp describes a different run).
+ */
+function readVerifiedMeta(db) {
+  const REQUIRED = ["schema", "stamped_at_utc", "run_id", "tool_version", "evidence_digest", "source_identity"];
+  const hasTable = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='verified_meta'"
+  ).get();
+  if (!hasTable) return { ok: false, reason: "no verified_meta table (pre-provenance write)" };
+  const values = {};
+  for (const row of db.prepare("SELECT key, value FROM verified_meta").all()) values[row.key] = row.value;
+  for (const k of REQUIRED) {
+    if (typeof values[k] !== "string" || values[k] === "") return { ok: false, reason: "meta key missing or empty: " + k };
+  }
+  if (values.schema !== "sporeprint.verified-meta.v1") return { ok: false, reason: "unknown meta schema: " + values.schema };
+  const t = Date.parse(values.stamped_at_utc);
+  if (!Number.isFinite(t) || !/Z$/.test(values.stamped_at_utc)) return { ok: false, reason: "stamp is not RFC 3339 UTC" };
+  if (t > Date.now() + 5 * 60 * 1000) return { ok: false, reason: "stamp is future-dated (" + values.stamped_at_utc + ")" };
+  // Re-derive the digest over the rows present NOW, via the writer's own
+  // exported canonicalisation when reachable — two definitions of "canonical"
+  // would drift into a permanent false mismatch. Unreachable = SKIPPED-style
+  // refusal: without the shared definition this reader cannot vouch.
+  let digestOf = null;
+  for (const rel of ["../../sporeprint/src/cli.js", "../../../sporeprint/src/cli.js"]) {
+    try { digestOf = require(rel).evidenceDigest; break; } catch {}
+  }
+  if (!digestOf) return { ok: false, reason: "sporeprint's canonical digest is unreachable; cannot re-verify the stamp" };
+  const rows = db.prepare("SELECT receiver, name, status, detail, shape FROM verified_surface").all();
+  const actual = digestOf(rows);
+  if (actual !== values.evidence_digest) {
+    return { ok: false, reason: "evidence digest mismatch (rows changed after stamping, or a different run)" };
+  }
+  return { ok: true, values };
+}
+
+module.exports = { open, duplicateSets, kindCoverage, deadExports, surface, diagnostics, render, readVerifiedMeta };
