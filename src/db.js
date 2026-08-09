@@ -90,6 +90,10 @@ function buildMap(root, dbPath, opts) {
   const facts = {
     root: displayRoot(root),
     builtAt: new Date().toISOString(),
+    // LIMITS §11: both axes of staleness, recorded at build time so later queries
+    // can refuse a confident-but-wrong map instead of silently trusting it.
+    extractorSha: X.extractorSha(),
+    targetSha: X.targetSha(root),
     gateList: X.extractGateList(root),
     stdlibCases: X.extractStdlibCases(root),
     inlineTables: X.extractInlineTables(root),
@@ -147,6 +151,8 @@ function buildMap(root, dbPath, opts) {
      (r) => [r.code, r.file, r.line, r.context]);
   db.prepare("INSERT INTO meta VALUES (?,?)").run("root", displayRoot(root));
   db.prepare("INSERT INTO meta VALUES (?,?)").run("builtAt", facts.builtAt);
+  db.prepare("INSERT INTO meta VALUES (?,?)").run("extractorSha", facts.extractorSha);
+  db.prepare("INSERT INTO meta VALUES (?,?)").run("targetSha", facts.targetSha);
   if (keepOpen) facts.db = db; else db.close();
 
   // JSON mirror — same facts, portable, diffable in a PR. Suppressed for a

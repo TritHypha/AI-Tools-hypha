@@ -52,10 +52,15 @@ query rather than a hand search — a hand search cannot support an exhaustivene
 hypha map    --root <galerina> [--db hypha.db]                build the fact DB (+ .json mirror)
 hypha report --root <galerina> [--db hypha.db] [--out FILE]   map + full markdown report
 hypha query  <name>[:<arg>] --root <galerina> [--db hypha.db] one query as JSON
+hypha status --root <galerina> [--db hypha.db]                counts + freshness (JSON)
 ```
 
 `--root` falls back to `GALERINA_ROOT`. Queries: `duplicate-sets`, `kind-coverage`,
 `dead-exports`, `surface[:name]`, `diagnostics[:keyword]`.
+
+`--stale warn|refuse|ignore` (default `warn`): when opening an **existing** DB whose
+`extractorSha` / `targetSha` no longer match the live extractor or Galerina `dist/`, either warn
+on stderr, exit `3`, or ignore. A rebuild in the same process is always fresh.
 
 ### `--in-memory` — passive mode
 

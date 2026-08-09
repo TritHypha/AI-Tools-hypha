@@ -8,6 +8,7 @@
 //                                                      map (if needed) + full markdown report
 //   hypha query  <duplicate-sets|kind-coverage|dead-exports|surface[:name]|diagnostics[:kw]>
 //                --root <galerina> [--db hypha.db]
+//   hypha status --root <galerina> [--db hypha.db]     counts + freshness (JSON)
 //
 // --root falls back to the GALERINA_ROOT environment variable. The target
 // checkout is READ-ONLY to this tool — all writes go to the --db path.
@@ -16,75 +17,114 @@
 //   Builds the facts in memory and answers straight from them: no `.db` file,
 //   no `.db.json` mirror, nothing left on disk. Use it for a one-off question.
 //
-//   The persistent path remains the default, because the DB is not incidental
-//   to this tool: it is what lets one run be diffed against another, and what
-//   lets `sporeprint` write its execution-verified matrix into the SAME file so
-//   static visibility can be joined against runtime ground truth. A throwaway
-//   scan has nothing to diff and nothing to join — so it should not pay for a
-//   file, and should not leave one behind.
-//
-//   Rule of thumb: `--in-memory` to ask a question, the default to keep a
-//   fact base.
+// FRESHNESS — `--stale warn|refuse|ignore`  (default: warn)
+//   LIMITS §11: a fact base can go stale because the *extractor* moved or the
+//   *target dist/* moved. After opening an existing DB (not after a rebuild),
+//   compare stored extractorSha/targetSha to live values. warn → stderr + continue;
+//   refuse → exit 3; ignore → silent.
 // =============================================================================
 "use strict";
 
 const fs = require("fs");
 const path = require("path");
 const { buildMap } = require("./db");
+const X = require("./extract");
 const Q = require("./queries");
 
-/** Minimal arg parser: positionals + --flag value pairs. */
+/** Minimal arg parser: positionals + --flag value pairs + boolean flags. */
 function parseArgs(argv) {
+  const BOOL = new Set(["in-memory"]);
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i].startsWith("--")) { out[argv[i].slice(2)] = argv[i + 1]; i++; }
-    else out._.push(argv[i]);
+    if (argv[i].startsWith("--")) {
+      const key = argv[i].slice(2);
+      if (BOOL.has(key) || argv[i + 1] === undefined || String(argv[i + 1]).startsWith("--")) {
+        out[key] = true;
+      } else {
+        out[key] = argv[i + 1];
+        i++;
+      }
+    } else out._.push(argv[i]);
   }
   return out;
+}
+
+function usage() {
+  console.log("usage: hypha <map|report|query|status> --root <galerina-checkout> [--db hypha.db] [--in-memory] [--out report.md] [--stale warn|refuse|ignore]");
+  console.log("       --in-memory  answer from memory; write no .db and no .json mirror");
+  console.log("       --stale      how to treat a fact base whose extractorSha/targetSha no longer match (default: warn)");
+  console.log("queries: duplicate-sets | kind-coverage | dead-exports | surface[:name] | diagnostics[:keyword]");
+}
+
+/**
+ * Apply freshness policy. Returns true if the caller may continue.
+ * Always ok after a rebuild in the same process (shas match by construction).
+ */
+function applyStalePolicy(db, root, policy, rebuilt) {
+  if (rebuilt || !root) return true;
+  const meta = Q.readMeta(db);
+  const check = X.freshnessCheck(meta, root);
+  if (check.ok) return true;
+  for (const w of check.warnings) {
+    console.error("[hypha] STALE: " + w);
+  }
+  if (policy === "refuse") {
+    console.error("[hypha] refusing to answer from a stale fact base (--stale refuse). Re-run `hypha map`.");
+    process.exit(3);
+  }
+  if (policy === "ignore") return true;
+  // warn (default)
+  console.error("[hypha] continuing with a possibly-stale fact base (pass --stale refuse to fail closed, or re-run map).");
+  return true;
 }
 
 function main() {
   const a = parseArgs(process.argv.slice(2));
   const cmd = a._[0];
   const root = a.root || process.env.GALERINA_ROOT;
-  // `--in-memory` is a boolean flag, so the minimal parser will have eaten the
-  // NEXT token as its "value". Treat any presence of the flag as true and push
-  // that token back — otherwise `--in-memory report` silently loses `report`.
-  const inMemory = process.argv.includes("--in-memory");
+  const inMemory = !!a["in-memory"] || process.argv.includes("--in-memory");
   const dbPath = inMemory ? ":memory:" : (a.db || path.join(process.cwd(), "hypha.db"));
+  const stalePolicy = (a.stale || "warn").toLowerCase();
+  if (!["warn", "refuse", "ignore"].includes(stalePolicy)) {
+    console.error("hypha: --stale must be warn|refuse|ignore");
+    process.exit(2);
+  }
 
-  if (!cmd || !["map", "report", "query"].includes(cmd)) {
-    console.log("usage: hypha <map|report|query> --root <galerina-checkout> [--db hypha.db] [--in-memory] [--out report.md]");
-    console.log("       --in-memory  answer from memory; write no .db and no .json mirror");
+  if (!cmd || !["map", "report", "query", "status"].includes(cmd)) {
+    usage();
     process.exit(2);
   }
   if (inMemory && cmd === "map") {
-    // `map` exists to PRODUCE the fact base. In memory it would build one and
-    // throw it away, which is not a lesser version of the command — it is a
-    // no-op wearing its name. Refuse rather than appear to succeed.
-    console.error("hypha: `map --in-memory` would build a fact base and discard it. Use `report`/`query --in-memory` to ask a question, or drop --in-memory to keep the DB.");
+    console.error("hypha: `map --in-memory` would build a fact base and discard it. Use `report`/`query`/`status --in-memory` to ask a question, or drop --in-memory to keep the DB.");
     process.exit(2);
   }
-  if ((cmd === "map" || cmd === "report" || inMemory || !fs.existsSync(dbPath)) && !root) {
+  if ((cmd === "map" || cmd === "report" || cmd === "status" || inMemory || !fs.existsSync(dbPath)) && !root) {
     console.error("hypha: need --root or GALERINA_ROOT (a Galerina checkout to map)");
     process.exit(2);
   }
 
-  // In passive mode the handle must stay OPEN: an in-memory database ceases to
-  // exist when its last handle closes, so a closed one cannot be re-opened to
-  // query. keepOpen returns it on facts.db.
   let liveDb = null;
+  let rebuilt = false;
   if (cmd === "map" || cmd === "report" || inMemory || !fs.existsSync(dbPath)) {
     const facts = buildMap(root, dbPath, inMemory ? { json: false, keepOpen: true } : undefined);
     liveDb = facts.db ?? null;
+    rebuilt = true;
     console.error("[hypha] mapped: " + facts.gateList.names.length + " gate names, " +
       facts.stdlibCases.length + " stdlib arms, " + facts.inlineTables.length + " inline tables, " +
       facts.kindSets.length + " kind-sets, " + facts.exportedCheckers.length + " exported checkers -> " +
       (inMemory ? "(memory — nothing written)" : dbPath));
+    console.error("[hypha] freshness: extractorSha=" + facts.extractorSha.slice(0, 12) +
+      "… targetSha=" + facts.targetSha.slice(0, 12) + "…");
     if (cmd === "map") return;
   }
 
   const db = liveDb ?? Q.open(dbPath);
+  applyStalePolicy(db, root, stalePolicy, rebuilt);
+
+  if (cmd === "status") {
+    console.log(JSON.stringify(Q.status(db, root), null, 2));
+    return;
+  }
   if (cmd === "report") {
     const md = Q.render(db);
     if (a.out) { fs.writeFileSync(a.out, md); console.error("[hypha] report -> " + a.out); }
@@ -103,6 +143,7 @@ function main() {
     null;
   if (result === null) {
     console.error("hypha: unknown query '" + which + "'");
+    usage();
     process.exit(2);
   }
   console.log(JSON.stringify(result, null, 2));

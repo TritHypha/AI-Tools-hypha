@@ -56,7 +56,11 @@ independent place a method name can be handled.
 
 | column | meaning |
 |---|---|
-| `receiver_tag` | the `__tag` guarding the table — `list`, `map`, `string`, … |
+| `receiver_tag` | the `__tag` guarding the table — `list`, `map`, `string`, … — or `unresolved` for a switch the extractor could not attribute to a receiver |
+
+**`unresolved` is context, not dispatch.** Those rows are extracted so a human can glance at nearby
+switches, but `surface` **excludes** them from the inline layer (LIMITS.md §12). Counting them as
+methods produced false presence (e.g. a method named `"0"` from the string-escape decoder).
 
 **This table is the reason `surface` exists.** `.push()` was once judged unsupported because only
 this layer was read; it was in `gate_names` the whole time.
@@ -154,8 +158,15 @@ behaviour; whether a code can fire is an execution question.
 meta (key TEXT, value TEXT)
 ```
 
-`root` (the mapped checkout) and `builtAt` (ISO timestamp). Two rows, so a report can never be
-mistaken for a fresh one, and a stale DB identifies itself.
+| key | meaning |
+|---|---|
+| `root` | display basename of the mapped checkout (never an absolute path) |
+| `builtAt` | ISO timestamp of the map run |
+| `extractorSha` | SHA-256 of `src/extract.js` at build time (LIMITS §11 axis 1) |
+| `targetSha` | fingerprint of mapped `dist/*.js` sizes+mtimes (+ `galerina.mjs`) (axis 2) |
+
+Four rows. A report can never be mistaken for a fresh one, and a stale DB can **name which axis
+moved**. `hypha query` / `report` / `status` re-hash the live tree and compare; see `--stale`.
 
 ---
 
@@ -175,7 +186,7 @@ In passive mode the shape below is the only shape there is.
 
 | mirror key | table(s) | how the shape differs |
 |---|---|---|
-| `root`, `builtAt` | `meta` | two scalars, not two key/value rows |
+| `root`, `builtAt`, `extractorSha`, `targetSha` | `meta` | scalars on the object; four key/value rows in the DB |
 | `gateList` | `gate_names` | one object `{ file, startLine, names }`, not a row per name — and it keeps `file`/`startLine`, which the table does not have |
 | `stdlibCases` | `stdlib_cases` | same shape |
 | `inlineTables` | `inline_cases` | ★ **one entry per receiver table, holding `cases[]`** — the DB stores one row per *case* |

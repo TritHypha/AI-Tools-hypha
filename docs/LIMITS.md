@@ -151,14 +151,15 @@ Not everything here is a caveat. These are proven and may be depended on:
 
 ## 10. Roadmap
 
-- **Re-map after an extractor change** — see item 11. The highest-value repair here is no longer a
-  code change; it is making a stale fact base announce itself.
+- ~~**Re-map after an extractor change** / freshness stamps~~ — done 2026-08-09 (item 11).
+- ~~Unattributed inline switches~~ — done 2026-08-09 (item 12).
 - A surface lane for the WASM/SLIDE backend once the DSS rewrite lands.
 - Near-duplicate clustering across **all** set literals, not just flow-kind sets.
+- Optionally mirror `verified_surface` into the JSON export when present (today: SQLite only —
+  see below).
 
 *(The former first entry, "fix `extractParserKinds`", was completed on 2026-08-06 and is written up
-as item 4. It survived here for a while after it stopped being true — which is itself the argument
-for item 11.)*
+as item 4.)*
 
 ---
 
@@ -194,17 +195,25 @@ A fact base goes stale for **two unrelated reasons**, and they need different gu
 The five added are `dispatchGateSource`, `parseGateV3`, `formatGateV3`, `verifyGateV3Structure`,
 `analyzeGateV3Liveness` — a `.gate` v3 front-end that did not exist when the base was built.
 
-**Proposal.** `map` should record, alongside `builtAt`:
+### ✅ Fixed 2026-08-09 in this subproject
 
-- `extractorSha` — a hash over `src/extract.js`, and
-- ★ `targetSha` — a hash over the mapped `dist/` file list and mtimes,
+`map` records both axes in `meta` (and the JSON mirror):
 
-and every query should refuse, or at minimum warn, when either differs from what it finds now.
+- `extractorSha` — SHA-256 of `src/extract.js`
+- `targetSha` — fingerprint of mapped `dist/*.js` basenames + size + mtimeMs (+ `galerina.mjs`)
+
+`query` / `report` / `status` re-hash the live tree when `--root` is available and the DB was not
+just rebuilt in-process:
+
+| `--stale` | behaviour |
+|---|---|
+| `warn` (default) | print `[hypha] STALE: …` on stderr, continue |
+| `refuse` | exit **3** — fail closed |
+| `ignore` | silent (escape hatch for offline re-reads of a known snapshot) |
 
 > ⚠️ **The first version of this item proposed only `extractorSha`.** That guard is **blind to axis
-> 2**: the extractor can be byte-identical while the codebase it measured has moved underneath.
-> Recorded rather than quietly amended, because a half-guard that looks like a whole one is the
-> failure this file exists to describe — see item 4.
+> 2**. Both are now recorded. A half-guard that looks like a whole one is the failure this file
+> exists to describe — see item 4.
 
 This is the same shape as the `set_id` rule in item 6: **a value that is only meaningful within one
 run should be checked, not trusted, when it crosses out of it.**
@@ -255,30 +264,25 @@ when they are present in **1**.
    found by their `receiver.__tag === "…"` guard; the bad one had no guard and was taken anyway.
    **The guard is the thing that makes a switch a dispatch table.**
 
-### ✅ Fixed 2026-08-06 in the Galerina devtool
+### ✅ Fixed 2026-08-06 in the Galerina devtool · ✅ Fixed 2026-08-09 upstream here
 
-All three proposals landed in `packages-galerina/galerina-devtools-hypha`:
-
-| | before | after |
+| | before (false presence) | after |
 |---|---:|---:|
-| `surface` universe total | 185 | **181** |
-| asymmetric | 168 | **164** |
-| `--scan full` findingCount | 361 | **357** |
 | names with an overstated layer count | 25 | **0** |
-| the phantom method `"0"` | present | **gone** |
+| the phantom method `"0"` in attributed inline | present | **gone** |
 
-★ The uncertainty is **reported, not discarded** — `surface` now returns
-`unattributedSwitches: [{ at: "interpreter.js:2726", cases: 29 }]`. It is **context, not a finding**:
-a switch beside real dispatch is a lead worth a human glance, and leads do not belong in a CI
-count.
+**Extractor (this subproject):** cases are collected only while brace-depth is *inside* the
+`if (receiver.__tag …)` body that opened the bucket. Switches opened with no enclosing tag become
+`receiver_tag = 'unresolved'` buckets.
 
-Three self-test cases hold it in place, each proven to fail when the behaviour is reverted:
-an attributed table **does** put a name in the inline layer (`layers=2`); an unattributed one
-**does not** (`layers=1`); and the unattributed table is **still reported**.
+**Query:** `surface` excludes `unresolved` from the inline layer and returns
+`unattributedSwitches: [{ at, cases }]` as **context, not findings**.
 
-> ⬜ **This subproject's own `hypha.db.json` still carries the old figures** — it predates the fix,
-> exactly as item 11 describes. The corrected numbers come from the devtool, which is in-memory and
-> has no artifact to go stale.
+Self-test (`npm run self-test`) holds three cases: attributed counts; unattributed does not;
+unattributed is still reported.
+
+> Re-`map` after pulling this fix — a pre-fix `hypha.db` is exactly the stale artifact item 11
+> now refuses (or warns about).
 
 ## ★ The JSON mirror carries only the static lane
 

@@ -62,18 +62,28 @@ function duplicateSets(db) {
 
 /** Parser-producible flow kinds diffed against every kind-set: any set missing
  *  a producible kind is flagged — that is exactly how governed flows became
- *  invisible to checkers and the flow index. */
+ *  invisible to checkers and the flow index.
+ *
+ * A set containing *none* of the reference kinds is not a gating set (it is
+ * some other Set of FlowDecl-looking strings or an empty extract). Reporting
+ * it as "missing every kind" inflates gaps with noise. Skip those; only sets
+ * that gate on *some* flow kind and omit another are candidates. */
 function kindCoverage(db) {
   const kinds = db.prepare("SELECT kind FROM parser_kinds").all().map((r) => r.kind);
   const out = [];
+  let setsExamined = 0;
+  let setsSkippedNotGating = 0;
   for (const s of db.prepare("SELECT set_id, file, line FROM kind_sets").all()) {
     const members = new Set(db.prepare(
       "SELECT member FROM kind_set_members WHERE set_id = ?"
     ).all(s.set_id).map((r) => r.member));
+    const has = kinds.filter((k) => members.has(k));
+    if (has.length === 0) { setsSkippedNotGating++; continue; }
+    setsExamined++;
     const missing = kinds.filter((k) => !members.has(k));
     if (missing.length) out.push({ site: s.file + ":" + s.line, missing, has: [...members] });
   }
-  return { parserKinds: kinds, gaps: out };
+  return { parserKinds: kinds, gaps: out, setsExamined, setsSkippedNotGating };
 }
 
 /** Exported check* functions with zero call sites anywhere in dist — dead
@@ -90,31 +100,50 @@ function deadExports(db) {
 
 /** Where is a method name visible? Gate list (with author section), stdlib
  *  implementation arms, and inline fallback tables — the layered answer that
- *  prevents the `.push` class of miss. With no name, summarises the layers. */
+ *  prevents the `.push` class of miss. With no name, summarises the layers.
+ *
+ * LIMITS §12: `receiver_tag = 'unresolved'` is an unattributed switch, not a
+ * dispatch table. It must not contribute to the inline layer (false presence).
+ * Those tables are returned separately as `unattributedSwitches` (context). */
 function surface(db, name) {
+  // Attributed inline only — fail closed on unattributed.
+  const inlineSql =
+    "SELECT receiver_tag, file, line FROM inline_cases WHERE name = ? AND receiver_tag != 'unresolved'";
   if (name) {
     return {
       gate: db.prepare("SELECT section, line FROM gate_names WHERE name = ?").all(name),
       stdlib: db.prepare("SELECT file, line FROM stdlib_cases WHERE name = ?").all(name),
-      inline: db.prepare("SELECT receiver_tag, file, line FROM inline_cases WHERE name = ?").all(name),
+      inline: db.prepare(inlineSql).all(name),
     };
   }
+  // Case lines are what we store; MIN(line) is a lower bound on the switch open
+  // line (good enough to jump to the region). Context, not a finding.
+  const unaByFile = db.prepare(`
+    SELECT file, COUNT(*) AS cases, MIN(line) AS line
+    FROM inline_cases WHERE receiver_tag = 'unresolved'
+    GROUP BY file
+  `).all().map((r) => ({ at: r.file + ":" + r.line, cases: r.cases }));
+
   return {
     gateCount: db.prepare("SELECT COUNT(DISTINCT name) AS n FROM gate_names").get().n,
     bySection: db.prepare(
       "SELECT section, COUNT(DISTINCT name) AS n FROM gate_names GROUP BY section ORDER BY n DESC"
     ).all(),
     inlineTags: db.prepare(
-      "SELECT receiver_tag, COUNT(*) AS n FROM inline_cases GROUP BY receiver_tag ORDER BY n DESC"
+      "SELECT receiver_tag, COUNT(*) AS n FROM inline_cases WHERE receiver_tag != 'unresolved' GROUP BY receiver_tag ORDER BY n DESC"
     ).all(),
-    // Gate-listed names with NO stdlib arm and NO inline arm — visibility
-    // holes: routed somewhere this map does not yet model (registry, runtime).
+    // Gate-listed names with NO stdlib arm and NO *attributed* inline arm.
     unimplemented: db.prepare(`
       SELECT DISTINCT g.name FROM gate_names g
       WHERE NOT EXISTS (SELECT 1 FROM stdlib_cases s WHERE s.name = g.name)
-        AND NOT EXISTS (SELECT 1 FROM inline_cases i WHERE i.name = g.name)
+        AND NOT EXISTS (
+          SELECT 1 FROM inline_cases i
+          WHERE i.name = g.name AND i.receiver_tag != 'unresolved'
+        )
       ORDER BY g.name
     `).all().map((r) => r.name),
+    // Context, not a finding — a switch beside real dispatch is a lead.
+    unattributedSwitches: unaByFile,
   };
 }
 
@@ -176,16 +205,22 @@ function render(db) {
 
   const dg = diagnostics(db);
   L.push("", "## Diagnostic-code universe", "",
-    "- distinct FUNGI-* codes in dist: **" + dg.total + "**",
+    "- distinct FUNGI-*/GATE-* codes in dist: **" + dg.total + "**",
     "- (presence \u2260 reachability: a code with an empty trigger set never fires)");
 
   const s = surface(db);
   L.push("", "## Method surface summary", "",
     "- gate-list names: " + s.gateCount, "- by section:");
   for (const b of s.bySection) L.push("  - " + b.section + ": " + b.n);
-  L.push("- inline fallback tables: " +
-    s.inlineTags.map((t) => t.receiver_tag + "(" + t.n + ")").join(", "));
-  L.push("- gate-listed but neither stdlib-cased nor inline-cased (visibility holes): " +
+  L.push("- inline fallback tables (attributed only): " +
+    (s.inlineTags.length
+      ? s.inlineTags.map((t) => t.receiver_tag + "(" + t.n + ")").join(", ")
+      : "(none)"));
+  if (s.unattributedSwitches && s.unattributedSwitches.length) {
+    L.push("- unattributed switches (context, not dispatch): " +
+      s.unattributedSwitches.map((u) => u.at + " ×" + u.cases).join(", "));
+  }
+  L.push("- gate-listed but neither stdlib-cased nor attributed-inline (visibility holes): " +
     (s.unimplemented.length ? s.unimplemented.join(", ") : "(none)"));
 
   // If sporeprint has written its verified matrix into this DB, join it in —
@@ -265,4 +300,42 @@ function readVerifiedMeta(db) {
   return { ok: true, values };
 }
 
-module.exports = { open, duplicateSets, kindCoverage, deadExports, surface, diagnostics, render, readVerifiedMeta };
+/** Load meta key/value pairs from a fact DB. */
+function readMeta(db) {
+  return Object.fromEntries(
+    db.prepare("SELECT key, value FROM meta").all().map((r) => [r.key, r.value])
+  );
+}
+
+/**
+ * Status snapshot for humans and hooks: counts + freshness.
+ * `freshness` is null when no root was supplied (cannot re-hash the target).
+ */
+function status(db, root) {
+  const X = require("./extract");
+  const meta = readMeta(db);
+  const freshness = root ? X.freshnessCheck(meta, root) : null;
+  return {
+    meta,
+    freshness,
+    counts: {
+      gateNames: db.prepare("SELECT COUNT(DISTINCT name) AS n FROM gate_names").get().n,
+      stdlibCases: db.prepare("SELECT COUNT(*) AS n FROM stdlib_cases").get().n,
+      inlineCasesAttributed: db.prepare(
+        "SELECT COUNT(*) AS n FROM inline_cases WHERE receiver_tag != 'unresolved'"
+      ).get().n,
+      inlineCasesUnattributed: db.prepare(
+        "SELECT COUNT(*) AS n FROM inline_cases WHERE receiver_tag = 'unresolved'"
+      ).get().n,
+      kindSets: db.prepare("SELECT COUNT(*) AS n FROM kind_sets").get().n,
+      exportedCheckers: db.prepare("SELECT COUNT(*) AS n FROM exported_checkers").get().n,
+      parserKinds: db.prepare("SELECT COUNT(*) AS n FROM parser_kinds").get().n,
+      diagnostics: db.prepare("SELECT COUNT(DISTINCT code) AS n FROM diagnostics_codes").get().n,
+    },
+  };
+}
+
+module.exports = {
+  open, duplicateSets, kindCoverage, deadExports, surface, diagnostics, render,
+  readVerifiedMeta, readMeta, status,
+};

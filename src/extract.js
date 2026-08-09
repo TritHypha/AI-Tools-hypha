@@ -26,6 +26,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 /** Resolve the compiler dist directory under a Galerina root, failing loudly
  *  (a missing dist means the map would be silently empty — refuse instead). */
@@ -178,27 +179,82 @@ function extractStdlibCases(root) {
 /**
  * The interpreter's per-receiver fallbacks look like:
  *   if (receiver.__tag === "list") { switch (method) { case "count": … } }
- * Heuristic: on a `__tag === "x"` line open a bucket; every `case "n":` line
- * belongs to the most recent bucket until the next `__tag` guard. This is the
- * layer that mis-led a human reader into calling it "the method table" — the
- * graph records it as the FALLBACK layer it actually is.
+ *
+ * SCOPE RULE (LIMITS.md §12, fixed here 2026-08-09). A `case "n":` belongs to a
+ * table only while brace-depth is *strictly inside* the `if (receiver.__tag …)`
+ * body that opened it. The previous heuristic kept `current` until the next
+ * tag, so every later switch in the file — `safeDisplay` value-kinds, the
+ * string-escape decoder — was attributed to the last tag (often the real
+ * `unresolved` arm). That produced **false presence**: 25 names reported in
+ * the inline layer when they are formatters/escapes, not methods.
+ *
+ * Unattributed switches (a `switch` opened while no tag-bucket is open) are
+ * still extracted, tagged `unresolved`, and returned so `surface` can report
+ * them as context without counting them as dispatch. Fail closed on the layer
+ * union; report the uncertainty.
  */
 function extractInlineTables(root) {
   const file = "interpreter.js";
+  const lines = distLines(root, file);
   const buckets = [];
-  let current = null;
-  distLines(root, file).forEach((ln, i) => {
+  let depth = 0;
+  let current = null;       // attributed: inside receiver.__tag body
+  let una = null;           // unattributed switch body
+
+  /** Approximate brace delta; strings with braces are rare in this dist region. */
+  const braceDelta = (ln) => {
+    let d = 0;
+    for (let i = 0; i < ln.length; i++) {
+      const ch = ln[i];
+      if (ch === "{") d++;
+      else if (ch === "}") d--;
+    }
+    return d;
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
     const tag = ln.match(/receiver\.__tag\s*===\s*"([A-Za-z0-9_]+)"/);
     if (tag) {
-      current = { receiverTag: tag[1], file, line: i + 1, cases: [] };
+      // Close any open unattributed switch — a real tag supersedes it.
+      una = null;
+      current = {
+        receiverTag: tag[1],
+        file,
+        line: i + 1,
+        cases: [],
+        openDepth: depth,
+      };
       buckets.push(current);
-      return;
+    } else if (/switch\s*\(/.test(ln) && !current) {
+      // Switch with no enclosing receiver-tag guard: context, not dispatch.
+      una = {
+        receiverTag: "unresolved",
+        file,
+        line: i + 1,
+        cases: [],
+        openDepth: depth,
+      };
+      buckets.push(una);
     }
+
     const c = ln.match(/case\s+"([A-Za-z0-9_]+)"\s*:/);
-    if (c && current) current.cases.push({ name: c[1], line: i + 1 });
-  });
-  // Only buckets that actually dispatch methods are tables.
-  return buckets.filter((b) => b.cases.length > 0);
+    if (c) {
+      if (current && depth > current.openDepth) {
+        current.cases.push({ name: c[1], line: i + 1 });
+      } else if (una && depth > una.openDepth) {
+        una.cases.push({ name: c[1], line: i + 1 });
+      }
+    }
+
+    depth += braceDelta(ln);
+    if (depth < 0) depth = 0;
+    if (current && depth <= current.openDepth) current = null;
+    if (una && depth <= una.openDepth) una = null;
+  }
+  // Only buckets that actually collected cases are tables.
+  return buckets.filter((b) => b.cases.length > 0).map(({ receiverTag, file: f, line, cases }) =>
+    ({ receiverTag, file: f, line, cases }));
 }
 
 // ── kind sets (the drift-prone sentinels) ────────────────────────────────────
@@ -299,7 +355,8 @@ function extractDiagnostics(root) {
   for (const file of distFiles(root)) {
     const lines = distLines(root, file);
     lines.forEach((ln, i) => {
-      for (const m of ln.matchAll(/"(FUNGI-[A-Z0-9-]+)"/g)) {
+      // FUNGI-* (compute lane) and GATE-* (authority / .gate v3 lane). Presence ≠ reachability.
+      for (const m of ln.matchAll(/"((?:FUNGI|GATE)-[A-Z0-9-]+)"/g)) {
         // Grab whatever message-ish text sits nearby, for semantic filtering.
         const ctx = (ln + " " + (lines[i + 1] ?? "") + " " + (lines[i + 2] ?? ""))
           .replace(/\s+/g, " ").slice(0, 400);
@@ -308,6 +365,70 @@ function extractDiagnostics(root) {
     });
   }
   return out;
+}
+
+// ── freshness digests (LIMITS.md §11) ────────────────────────────────────────
+
+/** SHA-256 of this extractor. A fact base built by a different extractor is not
+ *  comparable to one built by this file — and until re-map must not be trusted. */
+function extractorSha() {
+  const p = path.join(__dirname, "extract.js");
+  return crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
+}
+
+/**
+ * Fingerprint of the *mapped target*: sorted basenames of dist/*.js with size
+ * and mtimeMs, plus the root CLI when present. Cheap (no full-file hashing of
+ * hundreds of KB × N), strong enough to detect "dist moved under us".
+ *
+ * Axis 2 of LIMITS §11: the extractor can be byte-identical while the codebase
+ * it measured has changed. Recording only extractorSha is a half-guard.
+ */
+function targetSha(root) {
+  const h = crypto.createHash("sha256");
+  const dir = distDir(root);
+  const files = fs.readdirSync(dir).filter((f) => f.endsWith(".js")).sort();
+  for (const f of files) {
+    const st = fs.statSync(path.join(dir, f));
+    h.update(f + "\0" + st.size + "\0" + st.mtimeMs + "\n");
+  }
+  const rootCli = path.join(root, "galerina.mjs");
+  if (fs.existsSync(rootCli)) {
+    const st = fs.statSync(rootCli);
+    h.update("galerina.mjs\0" + st.size + "\0" + st.mtimeMs + "\n");
+  }
+  h.update("fileCount=" + files.length + "\n");
+  return h.digest("hex");
+}
+
+/**
+ * Compare a stored meta map against the live tree / this extractor.
+ * Returns { ok, warnings: string[] }. Never throws on missing meta keys —
+ * an old DB simply reports every missing axis as a warning.
+ */
+function freshnessCheck(meta, root) {
+  const warnings = [];
+  const nowEx = extractorSha();
+  if (!meta.extractorSha) {
+    warnings.push("meta.extractorSha missing — fact base predates freshness stamps; re-run `hypha map`");
+  } else if (meta.extractorSha !== nowEx) {
+    warnings.push("extractorSha mismatch — src/extract.js changed since this DB was built; re-run `hypha map`");
+  }
+  if (root) {
+    let nowTg;
+    try { nowTg = targetSha(root); }
+    catch (e) {
+      warnings.push("targetSha unavailable: " + (e && e.message ? e.message : e));
+      return { ok: warnings.length === 0, warnings, extractorSha: nowEx, targetSha: null };
+    }
+    if (!meta.targetSha) {
+      warnings.push("meta.targetSha missing — fact base predates target stamps; re-run `hypha map`");
+    } else if (meta.targetSha !== nowTg) {
+      warnings.push("targetSha mismatch — Galerina dist/ (or galerina.mjs) changed since this DB was built; re-run `hypha map`");
+    }
+    return { ok: warnings.length === 0, warnings, extractorSha: nowEx, targetSha: nowTg };
+  }
+  return { ok: warnings.length === 0, warnings, extractorSha: nowEx, targetSha: meta.targetSha || null };
 }
 
 /**
@@ -352,4 +473,5 @@ module.exports = {
   extractGateList, extractStdlibCases, extractInlineTables,
   extractKindSets, extractPassCalls, extractExportedCheckers, extractDiagnostics,
   findCallSites, findAllCallSites, extractParserKinds,
+  extractorSha, targetSha, freshnessCheck,
 };

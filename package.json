@@ -1,13 +1,15 @@
 {
   "name": "hypha",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Static capability-map for Galerina: extracts dispatch surfaces, sentinel sets and checker wiring into a graph, then runs drift/dead-code/coverage queries over it.",
   "type": "commonjs",
   "bin": { "hypha": "./src/cli.js" },
   "scripts": {
     "map": "node src/cli.js map",
     "report": "node src/cli.js report",
-    "check-docs": "node src/check-docs.js"
+    "check-docs": "node src/check-docs.js",
+    "self-test": "node src/self-test.js",
+    "test": "node src/self-test.js"
   },
   "author": "Trithypha <hello@trithypha.dev>",
   "license": "UNLICENSED",

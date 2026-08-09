@@ -53,11 +53,13 @@ Reported separately so it never inflates a defect count.
 **The incident.** The same failure from the other side: the parser gained a kind and every gating
 set ignored it. Pure negative space — no test can notice the absence of a case nobody wrote.
 
-**Returns** `{ parserKinds, gaps }`; each gap carries `site`, `missing`, `has`.
+**Returns** `{ parserKinds, gaps, setsExamined, setsSkippedNotGating }`; each gap carries `site`,
+`missing`, `has`.
 
 The reference set is the 4 flow-decl kinds `parser.js` emits: `pureFlowDecl`, `guardedFlowDecl`,
 `secureFlowDecl`, `governedFlowDecl`. A set containing *some* of them and missing another is a
-gap; a set containing none is not a gating set and is skipped rather than reported.
+gap; a set containing none is not a gating set and is **skipped** (`setsSkippedNotGating`) rather
+than reported as "missing every kind".
 
 > **Read a gap as a candidate, not a defect.** Some exclusions are correct by design — the
 > execution lanes (`interpreter.js`, `runtime.js`, `bytecode-vm.js`) legitimately exclude governed
@@ -108,10 +110,19 @@ is the finding; a shape that hides it defeats the query.
 
 ### `surface` — no name
 
-Summary plus `unimplemented`: gate-listed names with no stdlib arm *and* no inline arm.
+Summary plus `unimplemented` and `unattributedSwitches`:
+
+| field | meaning |
+|---|---|
+| `unimplemented` | gate-listed names with no stdlib arm *and* no **attributed** inline arm |
+| `unattributedSwitches` | switches extracted but not under a `receiver.__tag` guard — **context, not findings** |
+| `inlineTags` | attributed receiver tables only (`unresolved` excluded) |
 
 **Read `unimplemented` carefully.** It means *this map does not model where the name is handled* —
 the registry and the runtime are not extracted. It is a list of questions, not a list of bugs.
+
+**Read `unattributedSwitches` carefully.** Presence here is not evidence a method is dispatched
+(LIMITS §12). The extractor keeps the lead; the surface union fails closed.
 
 ---
 
@@ -120,9 +131,9 @@ the registry and the runtime are not extracted. It is a list of questions, not a
 Added so that "does **any** checker warn about X?" is a query rather than a hand search — a hand
 search cannot support an exhaustiveness claim.
 
-- `diagnostics` — every `FUNGI-*` code with a site count and first location.
+- `diagnostics` — every `FUNGI-*` and `GATE-*` code with a site count and first location.
 - `diagnostics:<keyword>` — codes whose surrounding message text matches. Pipe-separated
-  alternatives: `diagnostics:narrow|truncat|precision`.
+  alternatives: `diagnostics:narrow|truncat|precision` or `diagnostics:SEM-001|WIRE-101`.
 
 **Presence is not reachability.** `FUNGI-NUMERIC-001` appears in source and can never fire — its
 trigger set is empty. This is the code *universe*. Whether a code fires is an execution question,
@@ -142,7 +153,18 @@ this query here.
 |---|---|
 | `0` | the query ran |
 | `2` | usage error — unknown query, or no `--root`/`GALERINA_ROOT` |
+| `3` | fact base is stale and `--stale refuse` was set |
 
 `query` does **not** exit non-zero on findings: it answers a question, and whether the answer is
 bad news is the reader's judgement. For CI gating use the Galerina-side devtool
 (`@galerina/devtools-hypha`), which exits `1` when findings are present.
+
+## Status command (CLI — not a query)
+
+```bash
+node src/cli.js status --root <galerina> [--db hypha.db] [--in-memory]
+```
+
+JSON: `{ meta, freshness, counts }`. Use it to see whether `extractorSha` / `targetSha` still match
+before trusting a persisted DB. Not listed in the query table above: it is a CLI command that
+inspects provenance, not a drift/coverage question over the fact tables.

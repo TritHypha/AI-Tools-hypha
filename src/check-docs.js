@@ -154,7 +154,9 @@ const say = (ok, label, detail) => { results.push({ ok, label, detail }); };
   } else {
     // `open` connects the database, `render` formats, and `readVerifiedMeta` validates the
     // sporeprint provenance stamp for `render` — none is a query a user can name at the CLI.
-    const NOT_QUERIES = new Set(["open", "render", "readVerifiedMeta"]);
+    // Helpers and report plumbing are not named queries; `status` is a CLI
+    // command documented under its own heading, not a ## `status` query.
+    const NOT_QUERIES = new Set(["open", "render", "readVerifiedMeta", "readMeta", "status"]);
     const fns = [...q.matchAll(/^function\s+([A-Za-z_][\w]*)/gm)].map((m) => m[1]).filter((n) => !NOT_QUERIES.has(n));
     // Headings are kebab-case (`duplicate-sets`); functions are camelCase. `surface` appears under
     // several headings (`surface`, `surface:<name>`) — one capability, several usages.
