@@ -31,11 +31,26 @@ const crypto = require("crypto");
 /** Resolve the compiler dist directory under a Galerina root, failing loudly
  *  (a missing dist means the map would be silently empty — refuse instead). */
 function distDir(root) {
-  const d = path.join(root, "packages-galerina", "galerina-core-compiler", "dist");
-  if (!fs.existsSync(d)) {
-    throw new Error("hypha: no compiler dist at " + d + " — pass a Galerina checkout via --root or GALERINA_ROOT");
+  const candidates = [
+    path.join(root, "packages-ts", "galerina-core-compiler", "dist"),
+    path.join(root, "packages-galerina", "galerina-core-compiler", "dist"),
+  ];
+  const present = candidates.filter((candidate) => {
+    try {
+      return fs.statSync(candidate).isDirectory();
+    } catch (error) {
+      if (error && error.code === "ENOENT") return false;
+      throw error;
+    }
+  });
+  if (present.length === 0) {
+    throw new Error("hypha: no compiler dist at any registered layout (" +
+      candidates.join(", ") + ") — pass a Galerina checkout via --root or GALERINA_ROOT");
   }
-  return d;
+  if (present.length > 1) {
+    throw new Error("hypha: ambiguous compiler dist layouts (" + present.join(", ") + ")");
+  }
+  return present[0];
 }
 
 /** Read one dist file as lines; returns [] when absent so extractors degrade

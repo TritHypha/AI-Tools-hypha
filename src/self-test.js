@@ -9,6 +9,7 @@
 "use strict";
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const X = require("./extract");
 const Q = require("./queries");
@@ -29,6 +30,42 @@ console.log("hypha self-test");
 // ── unit: displayRoot never leaks absolute paths ─────────────────────────────
 check("displayRoot basename only", displayRoot("C:\\\\Users\\\\x\\\\Galerina") === "Galerina");
 check("displayRoot unknown", displayRoot(null) === "<unknown>");
+
+// ── unit: compiler layout resolution is explicit and fail-closed ────────────
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "hypha-layout-"));
+  const current = path.join(root, "packages-ts", "galerina-core-compiler", "dist");
+  const legacy = path.join(root, "packages-galerina", "galerina-core-compiler", "dist");
+  try {
+    fs.mkdirSync(current, { recursive: true });
+    let currentResult = null;
+    try { currentResult = X.distDir(root); } catch { /* reported by check */ }
+    check("distDir accepts current packages-ts layout", currentResult === current);
+
+    fs.rmSync(path.join(root, "packages-ts"), { recursive: true, force: true });
+    fs.mkdirSync(legacy, { recursive: true });
+    let legacyResult = null;
+    try { legacyResult = X.distDir(root); } catch { /* reported by check */ }
+    check("distDir retains legacy packages-galerina layout", legacyResult === legacy);
+
+    fs.mkdirSync(current, { recursive: true });
+    let ambiguous = null;
+    try { X.distDir(root); } catch (error) { ambiguous = error; }
+    check("distDir refuses ambiguous dual layouts",
+      ambiguous instanceof Error && /ambiguous compiler dist/.test(ambiguous.message),
+      ambiguous && ambiguous.message);
+
+    fs.rmSync(path.join(root, "packages-ts"), { recursive: true, force: true });
+    fs.rmSync(path.join(root, "packages-galerina"), { recursive: true, force: true });
+    let missing = null;
+    try { X.distDir(root); } catch (error) { missing = error; }
+    check("distDir refuses missing compiler layout",
+      missing instanceof Error && /no compiler dist/.test(missing.message),
+      missing && missing.message);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
 
 // ── unit: kindCoverage skips non-gating sets ─────────────────────────────────
 {
@@ -86,11 +123,15 @@ check("displayRoot unknown", displayRoot(null) === "<unknown>");
 const root = process.argv.includes("--root")
   ? process.argv[process.argv.indexOf("--root") + 1]
   : process.env.GALERINA_ROOT;
+let integrationLayoutError = null;
+if (root) {
+  try { X.distDir(root); } catch (error) { integrationLayoutError = error; }
+}
 
 if (!root) {
   console.log("  skip integration (pass --root or GALERINA_ROOT)");
-} else if (!fs.existsSync(path.join(root, "packages-galerina", "galerina-core-compiler", "dist"))) {
-  console.log("  skip integration (no compiler dist under root)");
+} else if (integrationLayoutError) {
+  console.log("  refuse integration (" + integrationLayoutError.message + ")");
   failed++;
   console.log("  FAIL dist missing");
 } else {
