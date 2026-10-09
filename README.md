@@ -1,5 +1,13 @@
 # hypha
 
+## Opt-in Myco link follower
+
+`node src/cli.js links follow --snapshot <myco.json> --root <expected-root>`
+follows Myco's local-link monitor in the foreground. `links status` reads once.
+Results include advisory provenance, freshness and CLEAN/FINDINGS/INCOMPLETE/UNKNOWN;
+Hypha does not scan the source or write these results to the capability database.
+See [the consumer contract and tests](docs/LINK-FOLLOWER.md).
+
 **Static capability-map for Galerina.** Extracts the compiler's dispatch surfaces, sentinel sets
 and checker wiring into SQLite, then runs deterministic drift/coverage/dead-code queries over it.
 

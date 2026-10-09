@@ -27,9 +27,8 @@
 
 const fs = require("fs");
 const path = require("path");
-const { buildMap } = require("./db");
-const X = require("./extract");
-const Q = require("./queries");
+// Link following has no SQLite/capability-map dependency.
+let buildMap, X, Q;
 
 /** Minimal arg parser: positionals + --flag value pairs + boolean flags. */
 function parseArgs(argv) {
@@ -50,6 +49,7 @@ function parseArgs(argv) {
 }
 
 function usage() {
+  console.log("       hypha links <status|follow> --snapshot <myco.json> --root <expected-root> (links --help)");
   console.log("usage: hypha <map|report|query|status> --root <galerina-checkout> [--db hypha.db] [--in-memory] [--out report.md] [--stale warn|refuse|ignore]");
   console.log("       --in-memory  answer from memory; write no .db and no .json mirror");
   console.log("       --stale      how to treat a fact base whose extractorSha/targetSha no longer match (default: warn)");
@@ -79,6 +79,12 @@ function applyStalePolicy(db, root, policy, rebuilt) {
 }
 
 function main() {
+  if (process.argv[2] === 'links') {
+    require('./links').linksCommand(process.argv.slice(3)).catch(e => { console.error(e.message); process.exitCode = 2; });
+    return;
+  }
+  ({ buildMap } = require('./db'));
+  X = require('./extract'); Q = require('./queries');
   const a = parseArgs(process.argv.slice(2));
   const cmd = a._[0];
   const root = a.root || process.env.GALERINA_ROOT;

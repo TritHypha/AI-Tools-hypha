@@ -9,7 +9,8 @@
     "report": "node src/cli.js report",
     "check-docs": "node src/check-docs.js",
     "self-test": "node src/self-test.js",
-    "test": "node src/self-test.js"
+    "test": "node src/self-test.js && node --test test/links.test.js",
+    "test:links": "node --test test/links.test.js"
   },
   "author": "Trithypha <hello@trithypha.dev>",
   "license": "UNLICENSED",
