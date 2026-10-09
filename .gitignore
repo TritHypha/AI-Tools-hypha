@@ -4,3 +4,5 @@ report.md
 node_modules/
 .worktrees/
 .myco/
+/test/.links-*/
+/test/node-compile-cache/
