@@ -70,6 +70,23 @@ hypha status --root <galerina> [--db hypha.db]                counts + freshness
 `extractorSha` / `targetSha` no longer match the live extractor or Galerina `dist/`, either warn
 on stderr, exit `3`, or ignore. A rebuild in the same process is always fresh.
 
+## Git worktree-aware mapping
+
+For Galerina with linked worktrees, use the shared AGENTS coordinator and pass the
+Galerina repository root (not the Hypha package directory). This keeps each in-memory
+Hypha result bound to the exact Galerina checkout it inspected:
+
+For the selected checkout, run `node tools/myco-hypha-worktree-scan.mjs hypha <galerina-repository> --query duplicate-sets --current-worktree-only --format text`.
+To inspect all registered checkouts, run `node tools/myco-hypha-worktree-scan.mjs hypha <galerina-repository> --query kind-coverage --include-worktrees --format json`.
+
+The coordinator records each registered worktree's branch or detached state, HEAD,
+lock and dirty-state identity alongside bounded Hypha findings. It invokes Hypha with
+`--in-memory --stale refuse`; dirty trees have unknown freshness. It never checks out
+branches, writes a database/report, or changes Git state. The tool is maintained in the
+sibling AGENTS repository at `tools/myco-hypha-worktree-scan.mjs`; its README entry
+defines the full query, report and refusal contracts. This is a shared operator
+workflow, not a second copy of Git-custody logic in Hypha.
+
 ### `--in-memory` — passive mode
 
 Builds the facts in memory and answers from them. **No `.db`, no `.json` mirror, nothing left on
